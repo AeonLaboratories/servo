@@ -17,45 +17,21 @@
 
 // Store big strings in ROM to conserve RData and EData space.
 rom char FIRMWARE[]	= R"Aeon Laboratories Servo ";
-rom char VERSION[]	= R"V.20170407-0000";
-
+rom char VERSION[]	= R"V.20171219-0000";
 
 // configuration options
-#define SERNO					0
 #define SERVO_DIRECTION			CLOCKWISE 	// wider command pulse => clockwise
-#define INCREMENTAL				TRUE		// treat current position as zero whenever command pulses are absent
-#define REVOLUTIONS				2.0			// the range of motion between CPW_MIN and CPW_MAX positions
-											// use 2.0 for 1 full turn in either direction
+#define INCREMENTAL				TRUE		// commands are relative to current position
 
 // which way does {+V to M+} drive the gearmotor output spline? (this is hardware-dependent)
 #define COP_DIRECTION			ANTICLOCKWISE
 #define ROTATION				(SERVO_DIRECTION == COP_DIRECTION)
 
-// CPW is control pulse width, in microseconds
-// The nominal CP period of 20000 microseconds establishes
-// a hard limit for CPW_MAX.
-#define CPW_UPPER_LIMIT			20000
-#define CPW_MIN					300									// the CPW range that maps to the servo
-#define CPW_MAX					2700								// range of motion (REVOLUTIONS)
-#define CPW_CTR					((CPW_MAX + CPW_MIN)/2)
-#define CPW_RANGE				(CPW_MAX - CPW_MIN)
-
 #define ENCODER_PPR				24									// rotary encoder pulses per revolution
 #define ENCODER_TRANSITIONS		4									// pulse edges per quadrature pulse
 #define POS_RESOLUTION			(ENCODER_PPR * ENCODER_TRANSITIONS)	// encoder transitions per revolution
-#define POS_RANGE				(POS_RESOLUTION * REVOLUTIONS)		//
-
-#define POS_PER_CPW				(POS_RANGE / CPW_RANGE)				// encoder transitions per microsecond of control pulse
-#define POS_PER_CPW_X2			(POS_PER_CPW * 2)					// used for rounding
-
-#define CMD_OFF					-1									// command pulse is off
-#define CMD_COMPLETE			0									// last received command was successful
-#define CMD_MIN					(CPW_MIN * POS_PER_CPW)
-#define CMD_MAX					(CPW_MAX * POS_PER_CPW)
-#define CMD_CTR					(CPW_CTR * POS_PER_CPW)
-
-#define MICROSECONDS_PER_DEGREE	(CPW_RANGE / REVOLUTIONS / 360.0)
-
+#define POS_MIN					-32767
+#define POS_MAX					32767
 
 // The CO_MAX_RESERVE provides time for the "stop pulse"
 // interrupt service routine, plus the time at the start
@@ -102,7 +78,7 @@ rom char VERSION[]	= R"V.20170407-0000";
 // A lower CO_MIN allows a tighter ACTIVE_POS_RANGE; a higher
 // CO_MIN produces greater speed/torque for small errors.
 // The test servo started moving (with no load) at around 1000.
-#define CO_MIN					1500
+#define CO_MIN					2500
 	
 #if CO_MIN < CO_MIN_RESERVE
 	#undef CO_MIN
@@ -112,23 +88,11 @@ rom char VERSION[]	= R"V.20170407-0000";
 #define CO_RANGE				(CO_MAX - CO_MIN)
 #define CO_GAIN					(CO_RANGE / ACTIVE_POS_RANGE)		// T1 clocks / position units
 
-// The nominal command pulse frequency is 50 Hz, so
-// whenever the command pulse is active, the servo should
-// see a new command pulse about every (CU_FREQ/50)
-// cycles. With CU_FREQ == 128, a pulse should arrive 
-// every second or third update_controller() cycle.
-#define CP_MAX_MISSES			8		// this many absent control pulses ==> CP is off
-
-
 typedef struct
 {
 	unsigned int clocks;
 	unsigned int ticks;
 } T0Count;
-
-// Position can be controlled by CMD CPW (Auto) or serial port (Manual)
-typedef char enum { Auto = 0, Manual } Modes;	
-
 
 ///////////////////////////////////////////////////////
 //
@@ -142,15 +106,17 @@ volatile T0Count CpDnT0;
 
 volatile BOOL REncA;
 volatile BOOL REncB;
+volatile BYTE REncAHistory;
+volatile BYTE REncBHistory;
+
 volatile int Pos;						// in rotary encoder transitions; at 96 edges per rev, +/-341 turns fit in an int
 
 volatile BOOL CpUp;
 volatile BOOL CpDn;
-int Cpw;								// command pulse width, calculated from CpDnT0 and CpUpT0
 
-int Cmd = CMD_OFF;						// usually Cpw, converted to Pos units
+BOOL CmdReceived = FALSE;
 
-Modes Mode;
+int Cmd;
 int Sp;									// setpoint; the commanded position (target Pos value)
 int Co;									// scratchpad for the next CO value
 int CO;
@@ -177,19 +143,25 @@ void isr_timer1();
 void isr_cmd();
 
 
+void init_switch(BOOL isOn, BYTE *history, BYTE *state)
+{
+	*state = isOn;
+	*history = isOn ? 0xFF : 0x00;
+}
+
 ///////////////////////////////////////////////////////
 // set defaults
 void init_irq()
-{	
+{
+	init_switch(RENC_A, &REncAHistory, &REncA);
+	init_switch(RENC_B, &REncBHistory, &REncB);
+	
 	SET_VECTOR(TIMER0, isr_timer0);
 	EI_T0();
 
 	SET_VECTOR(TIMER1, isr_timer1);
 	EI_T1();
 
-	SET_VECTOR(CMD_IVECT, isr_cmd);
-	EI_CMD();
-	
 	do_CO = disable_CO;
 	CO_disable();
 }
@@ -302,99 +274,32 @@ int microsecondsBetween(T0Count *before, T0Count *after)
 
 
 ///////////////////////////////////////////////////////
-void start_cpm()
-{
-	DI_CMD();
-	CpUp = CpDn = FALSE;
-	IRQ_CLEAR_CMD();
-	EI_CMD();	// restart command pulse monitor
-}
-
-
-///////////////////////////////////////////////////////
-BOOL check_cmd()
-{
-	static int prevCmd;
-	static uint8_t repeatsNeeded = 1;
-	int cmd;
-	
-	if (Mode == Manual)
-		return FALSE;				// ignore command pulses
-
-	if (!CpUp || !CpDn)
-		return FALSE;				// no command pulse has been received
-	
-	if (Cmd != CMD_COMPLETE)
-	{
-		cmd = microsecondsBetween(&CpUpT0, &CpDnT0);		
-		if (cmd < CPW_MIN)		cmd = CPW_MIN;
-		else if (cmd > CPW_MAX)	cmd = CPW_MAX;
-		Cpw = cmd;
-		
-		// round to position units: cmd = cmd * POS_PER_CPW + 0.5;
-		cmd *= POS_PER_CPW_X2;
-		cmd++;
-		cmd >>= 1;	// divide by 2
-		
-		if (cmd != Cmd)			// if this pulse differs from the current command value
-		{
-			if (cmd == prevCmd)		// but it matches the previous pulse
-			{
-				--repeatsNeeded;
-				if (!repeatsNeeded)
-					Cmd = cmd;
-			}
-			else
-				repeatsNeeded = Cmd == CMD_OFF ? 1 : 4;
-		}
-		prevCmd = cmd;
-	}
-
-	start_cpm();
-
-	return TRUE;					// a command pulse was received
-}
-
-
-///////////////////////////////////////////////////////
 void update_device()
 {
 	int error;
 	BOOL neg;
 	
 	reentrant void (*f)() = zero_CO;
-	Co = 0;	
-	
-	#if INCREMENTAL
-		if (Cmd == CMD_OFF) Pos = 0;
-			else
-	#endif		
-	
-	if (Cmd > CMD_COMPLETE)
+	Co = 0;
+
+	if (CmdReceived)
 	{
-		Sp = Cmd - CMD_CTR;
-		error = Sp - Pos;
-		if (error == 0)		// doesn't account for possible overshoot
-		{
-			#if INCREMENTAL
-				if (Mode == Auto)
-					Cmd = CMD_COMPLETE;	// ignore further pulses until they stop
-				else
-					Cmd = CMD_OFF;
-			#endif		
-		}
-		else			
-		{
-			if (neg = error < 0) error = -error;
-			if (error > ACTIVE_POS_RANGE)
-				Co = CO_MAX;
-			else
-				Co = error * CO_GAIN + CO_MIN;
-			if (neg == ROTATION)
-				f = negative_CO;
-			else
-				f = positive_CO;
-		}		
+		Pos = 0;
+		Sp = Cmd;
+		CmdReceived = FALSE;
+	}
+	
+	if (error = Sp - Pos)
+	{
+		if (neg = error < 0) error = -error;
+		if (error > ACTIVE_POS_RANGE)
+			Co = CO_MAX;
+		else
+			Co = error * CO_GAIN + CO_MIN;
+		if (neg == ROTATION)
+			f = negative_CO;
+		else
+			f = positive_CO;
 	}
 	
 	DI();
@@ -406,20 +311,11 @@ void update_device()
 
 ///////////////////////////////////////////////////////
 void update_controller()
-{
-	static uint8_t nUpdates;	// CO updates since last command pulse monitor restart
-	
-	if (check_cmd()) nUpdates = 0;
-	
+{	
 	if (EnableControllerUpdate)
 	{
 		EnableControllerUpdate = FALSE;	// re-enabled later by isr_timer0
 		
-		if (uint8CounterReset(&nUpdates, CP_MAX_MISSES))
-		{
-			Cmd = CMD_OFF;
-			start_cpm();			// restart cp monitor, in case an IRQ was missed
-		}
 		update_device();
 	}
 }
@@ -428,7 +324,7 @@ void update_controller()
 ///////////////////////////////////////////////////////
 void report_header()
 {
-	printromstr(R"--Cpw --Cmd ---Sp --Pos ---CO Error");
+	printromstr(R"--Cmd --Pos ---CO Error");
 	endMessage();
 }
 
@@ -436,12 +332,10 @@ void report_header()
 ////////////////////////////////////////////////////////
 void report_device()
 {
-	printi(Cpw, 5, ' '); printSpace();
-	printi(Cmd, 5, ' '); printSpace();
-	printi(Sp, 5, ' '); printSpace();
-	printi(Pos, 5, ' '); printSpace();
-	printi(CO, 5, ' '); printSpace();
-	printi(Error, 5, ' ');	
+	printi(Sp, 5, ' ');
+	printi(Pos, 6, ' ');
+	printi(CO, 6, ' ');
+	printi(Error, 6, ' ');	
 	endMessage();
 }
 
@@ -464,29 +358,16 @@ void do_commands()
 		else if (c == 'z')			// program data
 		{
 			printromstr(FIRMWARE); printromstr(VERSION); endMessage();
-			printromstr(R"S/N:"); printi(SERNO, 4, ' '); endMessage();
-			printromstr(R"CPW_MIN:"); printi(CPW_MIN, 4, ' ');
-			printromstr(R"   CPW_MAX:"); printi(CPW_MAX, 6, ' ');
-			printromstr(R"   uS/deg:"); printdec(100*MICROSECONDS_PER_DEGREE, 6, ' ', 2); endMessage();
-
-			printromstr(R"CMD_MIN:"); printi(CMD_MIN, 4, ' ');
-			printromstr(R"   CMD_MAX:"); printi(CMD_MAX, 6, ' '); endMessage();
-			printromstr(R"CO_MIN: "); printi(CO_MIN, 4, ' ');
-			printromstr(R"   CO_MAX: "); printi(CO_MAX, 6, ' '); endMessage();
 			endMessage();
 		}
 		else if (c == 'h')			// report header
 		{
 			report_header();
 		}
-		else if (c == 'a')			// auto mode
+		else if (c == 's' || c == '0')			// stop
 		{
-			Mode = Auto;
-		}
-		else if (c == 's')			// stop
-		{
-			Mode = Manual;
-			Cmd = CMD_OFF;
+			Cmd = 0;
+			CmdReceived = TRUE;
 		}
 		else						// multi-byte command
 		{			
@@ -502,11 +383,11 @@ void do_commands()
 				else						// one-time report
 					report_device();
 			}
-			else if (c == 'g')				// set control output
+			else if (c == 'g')				// move the given number of position units
 			{
-				Mode = Manual;
 				if (argPresent())
-					Cmd = tryArg(0, CMD_MAX, ERROR_POS, Cmd, FALSE);
+					Cmd = tryArg(POS_MIN, POS_MAX, ERROR_POS, Cmd, FALSE);
+				CmdReceived = TRUE;
 			}
 			else					// unrecognized command
 			{
@@ -542,10 +423,7 @@ BOOL debounce(BYTE contact, BYTE *history, BYTE *state)
 ///////////////////////////////////////////////////////
 void debounce_switches()
 {
-	static BYTE rencahistory;
-	static BYTE rencbhistory;
-
-	if (debounce(RENC_A, &rencahistory, &REncA))
+	if (debounce(RENC_A, &REncAHistory, &REncA))
 	{
 		if ((REncA == REncB) == ROTATION)
 			--Pos;
@@ -553,7 +431,7 @@ void debounce_switches()
 			++Pos;
 	}
 	
-	if (debounce(RENC_B, &rencbhistory, &REncB))
+	if (debounce(RENC_B, &REncBHistory, &REncB))
 	{
 		if ((REncA == REncB) == ROTATION)
 			++Pos;
@@ -561,7 +439,6 @@ void debounce_switches()
 			--Pos;
 	}	
 }
-
 
 
 ///////////////////////////////////////////////////////
@@ -610,22 +487,3 @@ void isr_timer1()
 	CO_off();
 }
 
-
-///////////////////////////////////////////////////////
-// CMD pin (which receives control pulses) changed state
-#pragma interrupt
-void isr_cmd()
-{
-	saveT0(&SaveT0);
-	if (CMD_is_high() && !CpUp)
-	{
-		copyT0Count(&SaveT0, &CpUpT0);
-		CpUp = TRUE;
-	}
-	else if (CpUp && !CpDn)
-	{
-		copyT0Count(&SaveT0, &CpDnT0);
-		CpDn = TRUE;
-		DI_CMD();
-	}
-}
