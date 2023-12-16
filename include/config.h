@@ -192,6 +192,19 @@
 #define TXB_SIZE				128
 
 ///////////////////////////////////////////////////////
+// Uncomment these #define's to use optional uart.c
+// functions; comment out unused ones to save memory.
+//
+//#define _PEEK
+#define _ISDIGIT
+//#define _ISLOWER
+//#define _ISUPPER
+//#define _ISLETTER
+//#define _PRINTFARSTR
+#define _PRINTROMSTR
+
+
+///////////////////////////////////////////////////////
 // ADC configuration
 #define ADC_CTL0_INIT				(ADC_CONT | ADC_CEN)	// continuous mode
 //#undef ADC_CTL0_INIT										// one-shot mode
@@ -201,11 +214,11 @@
 ///////////////////////////////////////////////////////
 // Implementation-specific IRQ priorities
 #define EI_T0()					IRQ0_PRIORITY_HIGH(IRQ_T0);
+#define EI_T1()					IRQ0_PRIORITY_NOMINAL(IRQ_T1);
+#define EI_PC3()				IRQ2_PRIORITY_NOMINAL(IRQ_PC3);
 #define EI_RX()					IRQ0_PRIORITY_LOW(IRQ_U0R)
 #define EI_TX()					IRQ0_PRIORITY_LOW(IRQ_U0T)
 #define EI_ADC()				IRQ0_PRIORITY_LOW(IRQ_ADC);
-#define EI_T1()					IRQ0_PRIORITY_NOMINAL(IRQ_T1);
-#define EI_PC3()				IRQ2_PRIORITY_NOMINAL(IRQ_PC3);
 
 #define CMD_IVECT				PC3_IVECT
 #define IRQ_CMD					IRQ_PC3

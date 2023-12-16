@@ -17,11 +17,11 @@
 
 // Store big strings in ROM to conserve RData and EData space.
 rom char FIRMWARE[]	= R"Aeon Laboratories Servo ";
-rom char VERSION[]	= R"V.20171219-0000";
+rom char VERSION[]	= R"V.20220823-0000";
 
 // configuration options
 #define SERVO_DIRECTION			CLOCKWISE 	// wider command pulse => clockwise
-#define INCREMENTAL				TRUE		// commands are relative to current position
+//#define INCREMENTAL				TRUE		// commands are relative to current position (FALSE not implemented)
 
 // which way does {+V to M+} drive the gearmotor output spline? (this is hardware-dependent)
 #define COP_DIRECTION			ANTICLOCKWISE
@@ -60,11 +60,6 @@ rom char VERSION[]	= R"V.20171219-0000";
 	#define CO_MAX				TIMER_MAX
 #endif
 
-#define ACTIVE_POS_RANGE		11		// beyond this position error, CO is at max
-	// Adjust ACTIVE_POS_RANGE and CO_MIN to govern
-	// the servo speed and force near the target position
-	// while avoiding overshoot.
-
 // If CO is less than CO_MIN_RESERVE, then the T1 isr can't turn it 
 // off on schedule. Empirical timing tests found a minimum pulse 
 // width of about 4 microseconds, which worked out to about 22 system
@@ -75,10 +70,8 @@ rom char VERSION[]	= R"V.20171219-0000";
 #define CO_MIN_RESERVE			(32 * T1_CLOCK_FREQ / SYS_FREQ)
 //
 
-// A lower CO_MIN allows a tighter ACTIVE_POS_RANGE; a higher
-// CO_MIN produces greater speed/torque for small errors.
-// The test servo started moving (with no load) at around 1000.
-#define CO_MIN					2500
+// A test servo started moving (with no load) at around 1000.
+#define CO_MIN					2000
 	
 #if CO_MIN < CO_MIN_RESERVE
 	#undef CO_MIN
@@ -86,7 +79,16 @@ rom char VERSION[]	= R"V.20171219-0000";
 #endif
 
 #define CO_RANGE				(CO_MAX - CO_MIN)
-#define CO_GAIN					(CO_RANGE / ACTIVE_POS_RANGE)		// T1 clocks / position units
+
+// When running at MAX_CO, setting Co to 0 stops within this many positions (or fewer).
+// The minimum error (Sp - Pos) that should produce maximum CO.
+#define ERROR_FOR_MAX_CO		7		// set CO to MAX if error is greater than this
+#define CO_GAIN					(CO_RANGE / ERROR_FOR_MAX_CO)		// T1 clocks / position units (must be positive)
+#define CO_SAFE					7000	// below this CO, even a stalled servo draws < 2 amps
+
+#define INTERVAL_NORMAL			6		// 80 deg / sec or slower; assume until data available
+#define INTERVAL_SLOW			30		// 16 deg / second or slower		
+#define INTERVAL_STALLED		192		// 2.5 deg / sec or slower
 
 typedef struct
 {
@@ -110,15 +112,26 @@ volatile BYTE REncAHistory;
 volatile BYTE REncBHistory;
 
 volatile int Pos;						// in rotary encoder transitions; at 96 edges per rev, +/-341 turns fit in an int
+volatile int PriorPos;
+
+// Interval tracks how many updates occurred between the two most recent
+// movement detections (position changes). Because control updates occur 
+// regularly, Interval is directly related to the servo speed. When Interval 
+// is 6, speed is 80 deg/sec or slightly slower; at 30, speed <= 16 deg/sec, 
+// and at 192, speed is <= 2.5 deg/sec (effectively stalled).
+volatile int IntervalCounter;
+volatile int Interval;
 
 volatile BOOL CpUp;
 volatile BOOL CpDn;
 
-BOOL CmdReceived = FALSE;
+// for proportional-integral control
+int PriorError;
+float Integral;
 
-int Cmd;
+BOOL Manual;							// CO is controlled by command
 int Sp;									// setpoint; the commanded position (target Pos value)
-int Co;									// scratchpad for the next CO value
+float Co;								// scratchpad for the next CO value
 int CO;
 reentrant void (*do_CO)();				// a pointer to the function that produces the CO signal
 
@@ -156,14 +169,14 @@ void init_irq()
 	init_switch(RENC_A, &REncAHistory, &REncA);
 	init_switch(RENC_B, &REncBHistory, &REncB);
 	
-	SET_VECTOR(TIMER0, isr_timer0);
-	EI_T0();
-
-	SET_VECTOR(TIMER1, isr_timer1);
-	EI_T1();
-
 	do_CO = disable_CO;
 	CO_disable();
+
+	SET_VECTOR(TIMER0, isr_timer0);
+	SET_VECTOR(TIMER1, isr_timer1);
+
+	EI_T0();
+	EI_T1();
 }
 
 
@@ -267,43 +280,85 @@ uint16_t clocksBetween(T0Count *before, T0Count *after)
 // multiplication could be eliminated by adjusting
 // the code that uses this function to use clocks
 // instead of microseconds.
-int microsecondsBetween(T0Count *before, T0Count *after)
+//int microsecondsBetween(T0Count *before, T0Count *after)
+//{
+//	return (int) (T0_CLOCK_PERIOD_US * clocksBetween(before, after));
+//}
+
+
+///////////////////////////////////////////////////////
+// For each motion, set \Integral \to 0, 
+// before the first call to this function.
+// This method implements a PI-type control (proportional-integral).
+void SetControlOutput(int error)
 {
-	return (int) (T0_CLOCK_PERIOD_US * clocksBetween(before, after));
+	static float Kc = CO_GAIN;				// Kc = controller gain (must be positive)
+	static float Ci = 0.2;					// Ci = 1.0 / Ti (note: no Kc)
+	int coLimit = CO_MAX;
+	int absError = error;
+
+	// Clear the Integral if direction of error changed
+	if ((error < 0) == (PriorError >= 0))
+		Integral = 0;
+	PriorError = error;
+	
+	if (absError < 0) absError = -absError;
+	Co = Kc * absError;					// proportional control
+	if (Interval > INTERVAL_SLOW)		// speed is slower than nominal
+	{
+		Integral += Ci*Co;				// Note: Kc is in co; Ci must not include it
+		coLimit = CO_SAFE;				// reduce CO limit to prevent overcurrent at low speeds
+		if (Integral > coLimit) Integral = coLimit;		// keep values sane; avoid long-term windup
+	}
+	Co += Integral;
+
+	if (Co < CO_MIN) Co = CO_MIN;
+	if (Co > coLimit) Co = coLimit;
+	if (error < 0) Co = -Co;
 }
 
 
 ///////////////////////////////////////////////////////
 void update_device()
 {
-	int error;
-	BOOL neg;
-	
+	int error = Sp - Pos;
 	reentrant void (*f)() = zero_CO;
-	Co = 0;
-
-	if (CmdReceived)
-	{
-		Pos = 0;
-		Sp = Cmd;
-		CmdReceived = FALSE;
-	}
+	int co;
 	
-	if (error = Sp - Pos)
+	if (Manual)
 	{
-		if (neg = error < 0) error = -error;
-		if (error > ACTIVE_POS_RANGE)
-			Co = CO_MAX;
-		else
-			Co = error * CO_GAIN + CO_MIN;
-		if (neg == ROTATION)
+		// enable for overshoot testing (sets Co to 0 after 1 turn at the commanded speed)
+		//if (error == 0) Co = 0.0;
+
+		if (Co == 0.0)
+			/* do nothing */;
+		else if ((Co < 0.0) == ROTATION)
 			f = negative_CO;
 		else
 			f = positive_CO;
 	}
+	else if (Sp != 0 && error != 0)
+	{
+		SetControlOutput(error);
+		
+		if ((error < 0) == ROTATION)
+			f = negative_CO;
+		else
+			f = positive_CO;
+	}
+	else	// Sp or error == 0; reset the control output variables
+	{
+		Co = 0.0;
+		PriorError = 0;
+		IntervalCounter = 0;
+		Interval = INTERVAL_NORMAL;	// assume a normal speed until data is available
+	}
+	
+	co = Co;
+	if (co < 0) co = -co;
 	
 	DI();
-	CO = Co;
+	CO = co;
 	do_CO = f;
 	EI();
 }
@@ -315,7 +370,6 @@ void update_controller()
 	if (EnableControllerUpdate)
 	{
 		EnableControllerUpdate = FALSE;	// re-enabled later by isr_timer0
-		
 		update_device();
 	}
 }
@@ -335,7 +389,7 @@ void report_device()
 	printi(Sp, 5, ' ');
 	printi(Pos, 6, ' ');
 	printi(CO, 6, ' ');
-	printi(Error, 6, ' ');	
+	printi(Error, 6, ' ');
 	endMessage();
 }
 
@@ -343,66 +397,87 @@ void report_device()
 ///////////////////////////////////////////////////////
 void do_commands()
 {
-	char c;
+	char c, c2;
+	int n;
 
-	while (!RxbEmpty())				// process a command
+	while (!RxbEmpty())					// process a command
 	{
-		c = getc();		
 		mask_clr(Error, ERROR_COMMAND);
+		GetInput();
+		c = Command[0];					// a command
+		c2 = Command[1];				// possibly a sub-command
 		
 		// single-byte commands
-		if (c == '\0')				// null command
+		if (c == '\0')					// null command
 		{
-			// (treat as single-byte command that does nothing)
+			// do nothing
 		}
-		else if (c == 'z')			// program data
+		else if (c == 'r')				// report
 		{
-			printromstr(FIRMWARE); printromstr(VERSION); endMessage();
-			endMessage();
+			if (NargPresent)			// set Datalogging interval
+			{
+				// rolls under to 0xFF (meaning "disable") if DatalogReset was 0
+				DatalogReset = TryInput(0, 255, ERROR_DATALOG, DatalogReset + 1, 0) - 1;
+				DatalogCount = 0;
+			}
+			else						// one-time report
+				report_device();
 		}
-		else if (c == 'h')			// report header
+		else if (c == 's')				// stop any movement
+		{
+			Sp = Pos;
+			Co = 0.0;
+		}
+		else if (c == 'c')				// clear Sp and Pos
+		{
+			Sp = Pos = 0;
+			Manual = FALSE;
+		}
+		else if (c == 'm')				// manually set CO
+		{
+			Co = TryInput(-CO_MAX, CO_MAX, ERROR_COMMAND, Co, 0);
+			if (!(Error & ERROR_COMMAND))
+			{
+				Manual = TRUE;
+				Pos = 0;
+				Sp = 96;
+				if (Co < 0) Sp = -Sp;
+			}
+		}
+		else if (c == 'g')				// move the given number of position units
+		{
+			if (NargPresent)
+				Sp = TryInput(POS_MIN, POS_MAX, ERROR_POS, Sp, 0);
+			if (!(Error & ERROR_POS))
+			{
+				// "reset" for new movement
+				Pos = 0;
+				PriorError = 0;
+				Integral = 0.0;
+				IntervalCounter = 0;
+				Manual = FALSE;
+			}
+		}
+		else if (c == 'h')				// report header
 		{
 			report_header();
 		}
-		else if (c == 's' || c == '0')			// stop
+		else if (c == 'z')				// program data
 		{
-			Cmd = 0;
-			CmdReceived = TRUE;
+			printromstr(FIRMWARE); printromstr(VERSION); endMessage();
 		}
-		else						// multi-byte command
-		{			
-			getArgs();
-			if (c == 'r')			// report
-			{
-				if (argPresent())			// set Datalogging interval
-				{
-					// DatalogReset rolls under to 0xFF (meaning "disable") if command arg is 0
-					DatalogReset = tryArg(0, 255, ERROR_DATALOG, DatalogReset + 1, FALSE) - 1;
-					DatalogCount = 0;
-				}
-				else						// one-time report
-					report_device();
-			}
-			else if (c == 'g')				// move the given number of position units
-			{
-				if (argPresent())
-					Cmd = tryArg(POS_MIN, POS_MAX, ERROR_POS, Cmd, FALSE);
-				CmdReceived = TRUE;
-			}
-			else					// unrecognized command
-			{
-				mask_set(Error, ERROR_COMMAND);
-			}
+		else							// unrecognized command
+		{
+			mask_set(Error, ERROR_COMMAND);
 		}
 	}
 	
 	if (EnableDatalogging)
 	{
-		EnableDatalogging = FALSE;	// re-enabled later by isr_timer0
+		EnableDatalogging = FALSE;		// re-enabled later by isr_timer0
 		if (DatalogReset != 0xFF && uint8CounterReset(&DatalogCount, DatalogReset))
 			report_device();
 	}
-
 }
 
 
@@ -410,9 +485,9 @@ void do_commands()
 BOOL debounce(BYTE contact, BYTE *history, BYTE *state)
 {
 	*history = (*history << 1) | (contact & 0x01);
-	if (*history == 0x01)
+	if (*history == 0x7F)		// change state after bouncing ends
 		*state = TRUE;
-	else if (*history == 0x80)
+	else if (*history == 0x80)	// change state after bouncing ends
 		*state = FALSE;
 	else
 		return FALSE;	// state didn't change
@@ -443,7 +518,6 @@ void debounce_switches()
 
 ///////////////////////////////////////////////////////
 // 
-#pragma interrupt
 void interrupt isr_timer0()
 {
 	++T0Ticks;
@@ -470,19 +544,34 @@ void interrupt isr_timer0()
 	#if CU_PERIOD > 1
 		if (CU_INTERVAL)
 	#endif
+		{
+			// check speed synchronously
+			if (CO != 0.0)
+			{
+				if (Pos == PriorPos)	// no position update occurred during the prior interval
+					IntervalCounter++;
+				else	// movement detected
+				{
+					Interval = IntervalCounter;
+					IntervalCounter = 0;
+				}	
+				if (IntervalCounter > Interval)
+					Interval = IntervalCounter;
+				
+				PriorPos = Pos;	
+			}
 			EnableControllerUpdate = TRUE;
+		}
 				
 //	if (ONE_SECOND)
 	if ((T0Ticks & 255) == 0)		// Data logging interval units are 1/8 of second
-		EnableDatalogging = TRUE;
-	
+		EnableDatalogging = TRUE;	
 }
 
 
 ///////////////////////////////////////////////////////
 // stop CO pulse
-#pragma interrupt
-void isr_timer1()
+void interrupt isr_timer1()
 {
 	CO_off();
 }
